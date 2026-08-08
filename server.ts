@@ -464,7 +464,11 @@ REGLAS STRICTAS DE CALIDAD Y "ANTI-SLOP DE IA":
    - "app.js": Lógica JavaScript interactiva funcional.
 
 SI LA BÚSQUEDA EN TIEMPO REAL ESTÁ ACTIVADA (${enableRealtimeSearch}):
-Debes incluir en 'app.js' e 'index.html' una interfaz funcional que realice peticiones fetch a '/api/gemini/search' con body JSON { "query": "..." } y muestre los resultados y fuentes web devueltas.`;
+Debes incluir en 'app.js' e 'index.html' una interfaz funcional que realice peticiones fetch a '/api/gemini/search' con body JSON { "query": "..." } y muestre los resultados y fuentes web devueltas.
+
+REGLAS OBLIGATORIAS DE ROBUSTEZ PARA EL WIDGET DE BÚSQUEDA Y SCRIPTS DE BÚSQUEDA:
+- El código JavaScript generado para el widget o analizador de búsqueda NUNCA debe asumir que un valor de configuración (ej: search engine, config, opciones) existe sin verificarlo antes; siempre debe usar un valor por defecto seguro (fallback) si cualquier parámetro viene null o undefined.
+- Todo el bloque de inicialización y ejecución del widget de búsqueda DEBE estar envuelto en un bloque try/catch para que un fallo del widget no rompa el resto de la página ni bloquee el evento de "carga completa" (DOMContentLoaded / window load) que el resto de la aplicación espera.`;
 
     const userPrompt = `Solicitud del usuario: "${prompt}"
 Configuración:
@@ -590,7 +594,9 @@ app.post("/api/refine-website", apiLimiter, authMiddleware, async (req: Request,
 
     const systemInstruction = `Eres "ClaudeCraft Targeted Refinement Engine".
 Tu trabajo es aplicar un parche o modificación dirigida (patch) sobre los archivos existentes de la web.
-NO regeneres la aplicación entera sin necesidad. Revisa los archivos actuales y devuelve únicamente una explicación y la lista 'updatedFiles' con los archivos que sufrieron cambios o fueron creados/modificados.`;
+NO regeneres la aplicación entera sin necesidad. Revisa los archivos actuales y devuelve únicamente una explicación y la lista 'updatedFiles' con los archivos que sufrieron cambios o fueron creados/modificados.
+
+Si la modificación afecta widgets o scripts de búsqueda: el código NUNCA debe asumir valores de configuración sin verificar (usar fallbacks seguros si es null/undefined) y la inicialización DEBE estar envuelta en try/catch.`;
 
     const userPrompt = `Archivos actuales del proyecto "${storedRecord.title}":
 ${existingFilesSummary}
