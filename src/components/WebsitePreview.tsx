@@ -30,7 +30,7 @@ export const WebsitePreview: React.FC<WebsitePreviewProps> = ({ website, onRefin
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': import.meta.env.VITE_APP_API_KEY,
+          'x-api-key': import.meta.env.VITE_APP_API_KEY || '',
         },
         body: JSON.stringify({ query: testQuery }),
       });

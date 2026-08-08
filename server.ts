@@ -370,7 +370,7 @@ Proporciona una respuesta extremadamente precisa, estructurada, actualizada y li
 Resume los hechos clave, datos cuantitativos más recientes y hallazgos principales en tiempo real.`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
+      model: "gemini-2.5-flash",
       contents: searchPrompt,
       config: {
         tools: [{ googleSearch: {} }],
@@ -498,7 +498,7 @@ Devuelve el objeto JSON estricto con los campos: title, tagline, category, hasRe
     const result = await generateValidatedJson(
       ai,
       {
-        model: "gemini-3.6-flash",
+        model: "gemini-2.5-flash",
         contents: userPrompt,
         config: {
           systemInstruction,
@@ -628,7 +628,7 @@ Devuelve un JSON estricto con:
     const result = await generateValidatedJson(
       ai,
       {
-        model: "gemini-3.6-flash",
+        model: "gemini-2.5-flash",
         contents: userPrompt,
         config: {
           systemInstruction,
