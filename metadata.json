@@ -1,0 +1,6 @@
+{
+  "name": "ClaudeCraft Web Studio",
+  "description": "Estudio de desarrollo web nivel Claude para crear páginas impecables y apps con búsqueda IA en tiempo real de Google.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
