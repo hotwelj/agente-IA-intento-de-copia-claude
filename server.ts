@@ -1,21 +1,104 @@
-import express from "express";
+import express, { Request, Response, NextFunction } from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import rateLimit from "express-rate-limit";
+import { z } from "zod";
 
 dotenv.config();
 
+// -------------------------------------------------------------
+// 7. Environment Variables Validation at Startup
+// -------------------------------------------------------------
+function validateEnv() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
+    console.error("❌ ERROR CRÍTICO AL ARRANCAR EL SERVIDOR:");
+    console.error("   GEMINI_API_KEY no está configurada o contiene el valor por defecto.");
+    console.error("   Asegúrate de definir GEMINI_API_KEY en las variables de entorno.");
+    process.exit(1);
+  }
+  console.log("✅ Configuración de variables de entorno validada correctamente.");
+}
+
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json({ limit: "10mb" }));
 
-// Initialize Gemini Client
+// -------------------------------------------------------------
+// 6. Structured Logging & Observability Helper
+// -------------------------------------------------------------
+interface LogMetadata {
+  endpoint: string;
+  durationMs: number;
+  status: "success" | "error";
+  tokensUsed?: {
+    promptTokens?: number;
+    responseTokens?: number;
+    totalTokens?: number;
+  };
+  error?: string;
+  ip?: string;
+  details?: Record<string, any>;
+}
+
+function logStructured(logData: LogMetadata) {
+  console.log(
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ...logData,
+    })
+  );
+}
+
+// -------------------------------------------------------------
+// 5. Rate Limiting & Basic Auth Middleware
+// -------------------------------------------------------------
+const rateLimitMax = process.env.RATE_LIMIT_MAX ? parseInt(process.env.RATE_LIMIT_MAX, 10) : 100;
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 min window
+  max: rateLimitMax,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Demasiadas peticiones desde esta dirección IP. Por favor reintenta en 15 minutos.",
+  },
+});
+
+const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  const expectedApiKey = process.env.APP_API_KEY;
+  if (!expectedApiKey || expectedApiKey.trim() === "") {
+    // Optional app auth key: if not set in environment, allow request
+    return next();
+  }
+
+  const providedKey = req.headers["x-api-key"];
+  if (providedKey !== expectedApiKey) {
+    logStructured({
+      endpoint: req.path,
+      durationMs: 0,
+      status: "error",
+      error: "401 Unauthorized - Header x-api-key inválido o ausente",
+      ip: req.ip,
+    });
+    return res.status(401).json({
+      error: "Acceso no autorizado. Se requiere un header 'x-api-key' válido.",
+    });
+  }
+
+  next();
+};
+
+// -------------------------------------------------------------
+// Gemini Client & FinishReason Checker
+// -------------------------------------------------------------
 const getGeminiClient = () => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("GEMINI_API_KEY no está configurada en las variables de entorno.");
+    throw new Error("GEMINI_API_KEY no está configurada.");
   }
   return new GoogleGenAI({
     apiKey,
@@ -27,6 +110,209 @@ const getGeminiClient = () => {
   });
 };
 
+// 3. Safety and Finish Reason Checker
+function checkFinishReason(response: any) {
+  const candidate = response.candidates?.[0];
+  if (!candidate) {
+    throw new Error("El modelo de IA no devolvió ningún candidato de respuesta.");
+  }
+
+  const finishReason = candidate.finishReason;
+  if (finishReason && finishReason !== "STOP") {
+    console.error(`⚠️ FinishReason no estándar detectado: ${finishReason}`);
+    if (finishReason === "SAFETY") {
+      throw new Error("La generación fue bloqueada por los filtros de seguridad (SAFETY). Modifica la consulta.");
+    } else if (finishReason === "MAX_TOKENS") {
+      throw new Error("La respuesta excedió el límite máximo de tokens alcanzable.");
+    } else if (finishReason === "RECITATION") {
+      throw new Error("La generación fue bloqueada por citas repetitivas o derechos de autor (RECITATION).");
+    } else {
+      throw new Error(`Generación interrumpida por el modelo. Motivo: ${finishReason}`);
+    }
+  }
+  return candidate;
+}
+
+// 2. JSON Validation & Automatic Retry Engine (up to 2 retries)
+async function generateValidatedJson<T>(
+  ai: GoogleGenAI,
+  params: {
+    model: string;
+    contents: string;
+    config?: any;
+  },
+  schema: z.ZodSchema<T>,
+  endpointName: string
+): Promise<{ data: T; usageMetadata?: any }> {
+  let attempts = 0;
+  const maxRetries = 2;
+  let currentPrompt = params.contents;
+  let lastError = "";
+
+  while (attempts <= maxRetries) {
+    attempts++;
+    try {
+      const response = await ai.models.generateContent({
+        model: params.model,
+        contents: currentPrompt,
+        config: {
+          ...(params.config || {}),
+          responseMimeType: "application/json",
+        },
+      });
+
+      checkFinishReason(response);
+
+      const rawText = response.text || "";
+      let parsedObj: any;
+      try {
+        parsedObj = JSON.parse(rawText);
+      } catch (jsonErr: any) {
+        throw new Error(`JSON SyntaxError: ${jsonErr.message}`);
+      }
+
+      const validationResult = schema.safeParse(parsedObj);
+      if (!validationResult.success) {
+        const issues = validationResult.error.issues
+          .map((e) => `${e.path.join(".")}: ${e.message}`)
+          .join("; ");
+        throw new Error(`Zod ValidationError: ${issues}`);
+      }
+
+      return {
+        data: validationResult.data,
+        usageMetadata: response.usageMetadata,
+      };
+    } catch (err: any) {
+      lastError = err.message || String(err);
+      console.warn(
+        `[${endpointName}] Intento ${attempts}/${maxRetries + 1} falló en validación JSON/FinishReason: ${lastError}`
+      );
+
+      if (attempts > maxRetries) {
+        throw new Error(
+          `Error persistente en formateo JSON tras ${maxRetries + 1} intentos: ${lastError}`
+        );
+      }
+
+      // Retry prompt feeding back the specific error
+      currentPrompt = `${params.contents}\n\n[ATENCIÓN: Tu intento anterior falló con el siguiente error de validación JSON: "${lastError}". Por favor re-genera la respuesta corrigiendo este error exacto y asegúrate de cumplir la estructura JSON válida esperada.]`;
+    }
+  }
+
+  throw new Error("Excedido número máximo de reintentos.");
+}
+
+// 4. Server-Side In-Memory File Store for Incremental Refinements
+interface StoredWebFile {
+  path: string;
+  language: string;
+  content: string;
+}
+
+interface StoredWebsite {
+  id: string;
+  title: string;
+  tagline: string;
+  category: string;
+  hasRealtimeSearch: boolean;
+  stepLog: any[];
+  designSystem: any;
+  searchConfig?: any;
+  files: StoredWebFile[];
+  createdAt: string;
+  promptUsed: string;
+}
+
+const websiteStore = new Map<string, StoredWebsite>();
+
+function assemblePreviewHtml(files: StoredWebFile[], title: string): string {
+  const indexFile = files.find((f) => f.path === "index.html" || f.path.endsWith(".html"));
+  const cssFile = files.find((f) => f.path === "styles.css" || f.path.endsWith(".css"));
+  const jsFile = files.find((f) => f.path === "app.js" || f.path.endsWith(".js"));
+
+  let baseHtml = indexFile ? indexFile.content : "<!DOCTYPE html><html><head></head><body></body></html>";
+
+  // Inject CSS if styles.css exists and isn't already linked inline
+  if (cssFile && cssFile.content) {
+    if (!baseHtml.includes("<style>") && !baseHtml.includes(cssFile.content.slice(0, 30))) {
+      const styleTag = `\n<style>\n${cssFile.content}\n</style>\n`;
+      if (baseHtml.includes("</head>")) {
+        baseHtml = baseHtml.replace("</head>", `${styleTag}</head>`);
+      } else {
+        baseHtml = styleTag + baseHtml;
+      }
+    }
+  }
+
+  // Inject JS if app.js exists and isn't already included
+  if (jsFile && jsFile.content) {
+    if (!baseHtml.includes("<script>") && !baseHtml.includes(jsFile.content.slice(0, 30))) {
+      const scriptTag = `\n<script>\n${jsFile.content}\n</script>\n`;
+      if (baseHtml.includes("</body>")) {
+        baseHtml = baseHtml.replace("</body>", `${scriptTag}</body>`);
+      } else {
+        baseHtml = baseHtml + scriptTag;
+      }
+    }
+  }
+
+  return baseHtml;
+}
+
+// -------------------------------------------------------------
+// Zod Schemas for Validation
+// -------------------------------------------------------------
+const SearchResponseSchema = z.object({
+  text: z.string(),
+});
+
+const DevStepSchema = z.object({
+  step: z.number(),
+  title: z.string(),
+  detail: z.string(),
+  status: z.enum(["pending", "active", "done"]),
+});
+
+const DesignSystemSchema = z.object({
+  primaryColor: z.string(),
+  backgroundColor: z.string(),
+  fontHeader: z.string(),
+  fontBody: z.string(),
+  spacingRatio: z.string(),
+  antiSlopRulesApplied: z.array(z.string()),
+});
+
+const SearchConfigSchema = z
+  .object({
+    defaultQuery: z.string(),
+    placeholder: z.string(),
+    searchType: z.enum(["news", "market", "general", "facts", "places"]),
+  })
+  .optional();
+
+const WebFileSchema = z.object({
+  path: z.string(),
+  language: z.string(),
+  content: z.string(),
+});
+
+const WebsiteStructureSchema = z.object({
+  title: z.string(),
+  tagline: z.string(),
+  category: z.enum(["landing", "portfolio", "saas", "search-app", "dashboard", "editorial", "custom"]),
+  hasRealtimeSearch: z.boolean(),
+  stepLog: z.array(DevStepSchema),
+  designSystem: DesignSystemSchema,
+  searchConfig: SearchConfigSchema,
+  files: z.array(WebFileSchema),
+});
+
+const RefinePatchSchema = z.object({
+  explanation: z.string(),
+  updatedFiles: z.array(WebFileSchema),
+});
+
 // -------------------------------------------------------------
 // API Routes
 // -------------------------------------------------------------
@@ -35,16 +321,24 @@ app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
-    geminiKeyPresent: Boolean(process.env.GEMINI_API_KEY),
+    geminiKeyPresent: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"),
   });
 });
 
-// Real-time Google Search AI Endpoint (Used by Studio & Generated Web Apps)
-app.post("/api/gemini/search", async (req, res) => {
+// 1. Real-time Google Search AI Endpoint
+app.post("/api/gemini/search", apiLimiter, authMiddleware, async (req: Request, res: Response) => {
+  const startTime = Date.now();
   try {
     const { query, category = "general", context = "" } = req.body;
 
     if (!query || typeof query !== "string") {
+      logStructured({
+        endpoint: "/api/gemini/search",
+        durationMs: Date.now() - startTime,
+        status: "error",
+        error: "Parámetro 'query' inválido",
+        ip: req.ip,
+      });
       return res.status(400).json({ error: "Se requiere un parámetro 'query' válido." });
     }
 
@@ -67,13 +361,14 @@ Resume los hechos clave, datos cuantitativos más recientes y hallazgos principa
       },
     });
 
+    checkFinishReason(response);
+
     const text = response.text || "No se obtuvieron resultados de búsqueda.";
     const candidate = response.candidates?.[0];
     const groundingMetadata = candidate?.groundingMetadata;
     const groundingChunks = groundingMetadata?.groundingChunks || [];
     const webSearchQueries = groundingMetadata?.webSearchQueries || [];
 
-    // Parse web search citations cleanly
     const citations = groundingChunks
       .map((chunk: any) => {
         if (chunk.web) {
@@ -86,6 +381,18 @@ Resume los hechos clave, datos cuantitativos más recientes y hallazgos principa
       })
       .filter(Boolean);
 
+    logStructured({
+      endpoint: "/api/gemini/search",
+      durationMs: Date.now() - startTime,
+      status: "success",
+      tokensUsed: {
+        promptTokens: response.usageMetadata?.promptTokenCount,
+        responseTokens: response.usageMetadata?.candidatesTokenCount,
+        totalTokens: response.usageMetadata?.totalTokenCount,
+      },
+      ip: req.ip,
+    });
+
     res.json({
       text,
       citations,
@@ -93,7 +400,13 @@ Resume los hechos clave, datos cuantitativos más recientes y hallazgos principa
       timestamp: new Date().toISOString(),
     });
   } catch (err: any) {
-    console.error("Error en /api/gemini/search:", err);
+    logStructured({
+      endpoint: "/api/gemini/search",
+      durationMs: Date.now() - startTime,
+      status: "error",
+      error: err.message || String(err),
+      ip: req.ip,
+    });
     res.status(500).json({
       error: "Error ejecutando búsqueda en tiempo real con Google AI.",
       details: err.message || String(err),
@@ -101,12 +414,20 @@ Resume los hechos clave, datos cuantitativos más recientes y hallazgos principa
   }
 });
 
-// Generate Website Endpoint (Claude-Grade Web Developer Engine)
-app.post("/api/generate-website", async (req, res) => {
+// 1 & 2. Generate Website Endpoint with Modular File Generation and Schema Retry
+app.post("/api/generate-website", apiLimiter, authMiddleware, async (req: Request, res: Response) => {
+  const startTime = Date.now();
   try {
     const { prompt, options } = req.body;
 
     if (!prompt || typeof prompt !== "string") {
+      logStructured({
+        endpoint: "/api/generate-website",
+        durationMs: Date.now() - startTime,
+        status: "error",
+        error: "Prompt no proporcionado",
+        ip: req.ip,
+      });
       return res.status(400).json({ error: "Se requiere un 'prompt' válido." });
     }
 
@@ -116,180 +437,233 @@ app.post("/api/generate-website", async (req, res) => {
     const customTheme = options?.customTheme;
 
     let themeDetails = `Estilo Preset: ${stylePreset}`;
-    if (stylePreset === 'custom-builder' && customTheme) {
+    if (stylePreset === "custom-builder" && customTheme) {
       themeDetails = `Tema Creado por Usuario:
-- Nombre: ${customTheme.themeName || 'Tema Personalizado'}
-- Color Primario Hex: ${customTheme.primaryHex || '#10b981'}
-- Color de Fondo Hex: ${customTheme.bgHex || '#0a0a0b'}
-- Tipografía: ${customTheme.fontFamily || 'sans'}
-- Redondeo de Bordes: ${customTheme.borderRadius || 'md'}`;
+- Nombre: ${customTheme.themeName || "Tema Personalizado"}
+- Color Primario Hex: ${customTheme.primaryHex || "#10b981"}
+- Color de Fondo Hex: ${customTheme.bgHex || "#0a0a0b"}
+- Tipografía: ${customTheme.fontFamily || "sans"}
+- Redondeo de Bordes: ${customTheme.borderRadius || "md"}`;
     }
 
     const ai = getGeminiClient();
 
-    const systemInstruction = `Eres "ClaudeCraft Developer Engine", un modelo de IA especializado en crear aplicaciones web y páginas web con el nivel de rigor técnico, precisión matemática, elegancia y atención al detalle de un Desarrollador Principal nivel Claude 3.5 Sonnet.
+    const systemInstruction = `Eres "ClaudeCraft Developer Engine", un desarrollador principal de nivel Claude 3.5 Sonnet.
+Tu misión es generar la estructura de archivos modular para un sitio o aplicación web.
 
 REGLAS STRICTAS DE CALIDAD Y "ANTI-SLOP DE IA":
-1. NUNCA uses frases clichés de marketing de IA (ej: "Supercharge your workflow", "Empower your business", "Revolutionize your experience").
-2. NUNCA crees páginas oscuras genéricas con gradientes neón azul/púrpura ni efectos fosforescentes brillantes que parezcan hechos por plantillas genéricas de IA.
+1. NUNCA uses frases clichés de marketing de IA (ej: "Supercharge your workflow", "Empower your business").
+2. NUNCA crees páginas oscuras genéricas con gradientes neón azul/púrpura ni efectos fosforescentes deslumbrantes.
 3. ESTILOS VISUALES IMPECABLES:
-   - Aplica rigurosamente el tema de diseño solicitado:
-     ${themeDetails}
-   - Tipografía con jerarquía matemática: Títulos limpios, interlineado amplio (1.5-1.7), legibilidad absoluta.
-   - Espaciado rítmico padding/margin consistente.
-4. METODOLOGÍA EN PASOS EXPLICITA (Debes incluir el paso a paso detallado de razonamiento):
-   - Paso 1: Análisis de Requerimientos y Experiencia de Usuario
-   - Paso 2: Sistema de Diseño y Jerarquía Visual
-   - Paso 3: Arquitectura de Estado y Lógica de Componentes
-   - Paso 4: Estrategia de Búsqueda IA en Tiempo Real con Google (si está activada)
-   - Paso 5: Generación de Código Limpio (HTML5 + Tailwind CSS + JS)
-   - Paso 6: Verificación de Detalles y Micro-interacciones
+   - Aplica el tema visual: ${themeDetails}
+   - Jerarquía tipográfica matemática clara, espaciado rítmico.
+4. GENERACIÓN MODULAR POR ARCHIVOS SEPARADOS:
+   Debes entregar tres archivos limpios en la lista 'files':
+   - "index.html": Estructura HTML5 limpia y semántica con CDN de Tailwind CSS (<script src="https://cdn.tailwindcss.com"></script>).
+   - "styles.css": Estilos CSS personalizados adicionales y animaciones si es necesario.
+   - "app.js": Lógica JavaScript interactiva funcional.
 
 SI LA BÚSQUEDA EN TIEMPO REAL ESTÁ ACTIVADA (${enableRealtimeSearch}):
-Debes integrar una interfaz interactiva de búsqueda en la página generada que se conecte con nuestro endpoint '/api/gemini/search'. Incluye código JavaScript directo en el HTML generado que envíe consultas a POST '/api/gemini/search' con JSON body { query: string } y muestre los resultados y fuentes web de Google en tiempo real de forma limpia e interactiva.
+Debes incluir en 'app.js' e 'index.html' una interfaz funcional que realice peticiones fetch a '/api/gemini/search' con body JSON { "query": "..." } y muestre los resultados y fuentes web devueltas.`;
 
-DEBES RESPONDER EXCLUSIVAMENTE EN FORMATO JSON CON ESTA ESTRUCTURA EXACTA (sin markdown adicional fuera del JSON):
-{
-  "title": "Nombre de la Aplicación/Página",
-  "tagline": "Eslogan profesional y humano sin clichés",
-  "category": "${websiteType}",
-  "hasRealtimeSearch": ${enableRealtimeSearch},
-  "stepLog": [
-    { "step": 1, "title": "Análisis de Requerimientos UX", "detail": "...", "status": "done" },
-    { "step": 2, "title": "Sistema de Diseño Matemático", "detail": "...", "status": "done" },
-    { "step": 3, "title": "Arquitectura de Componentes e Interacción", "detail": "...", "status": "done" },
-    { "step": 4, "title": "Integración de Búsqueda Google IA", "detail": "...", "status": "done" },
-    { "step": 5, "title": "Generación de Código HTML/CSS/JS", "detail": "...", "status": "done" },
-    { "step": 6, "title": "Auditoría Anti-Slop y Pulido Visual", "detail": "...", "status": "done" }
-  ],
-  "designSystem": {
-    "primaryColor": "#18181b",
-    "backgroundColor": "${stylePreset === 'dark-obsidian' ? '#0f172a' : '#fafafa'}",
-    "fontHeader": "Inter, sans-serif",
-    "fontBody": "Inter, sans-serif",
-    "spacingRatio": "1.25",
-    "antiSlopRulesApplied": [
-      "Sin gradientes neón púrpura/cian",
-      "Textos redactados en tono humano y natural",
-      "Espaciado UI ajustado a escala rítmica",
-      "Búsqueda web en tiempo real integrada con fuentes verificadas"
-    ]
-  },
-  "searchConfig": {
-    "defaultQuery": "Últimas noticias de tecnología y desarrollo web",
-    "placeholder": "Buscar información actualizada en tiempo real...",
-    "searchType": "news"
-  },
-  "previewHtml": "<!DOCTYPE html><html>...HTML COMPLETO Y FUNCIONAL Y FUNCIONALMENTE INTERACTIVO...</html>",
-  "files": [
-    {
-      "path": "index.html",
-      "language": "html",
-      "content": "..."
-    },
-    {
-      "path": "styles.css",
-      "language": "css",
-      "content": "..."
-    },
-    {
-      "path": "app.js",
-      "language": "javascript",
-      "content": "..."
-    }
-  ]
-}`;
-
-    const userPrompt = `Solicitud del usuario para construir la web:
-"${prompt}"
-
+    const userPrompt = `Solicitud del usuario: "${prompt}"
 Configuración:
-- Tipo de web: ${websiteType}
-- Búsqueda en tiempo real de Google integrada: ${enableRealtimeSearch ? 'SÍ (Incluir barra de búsqueda funcional conectada a /api/gemini/search)' : 'NO'}
-- Estilo estético: ${stylePreset}
+- Categoría: ${websiteType}
+- Búsqueda en tiempo real Google AI: ${enableRealtimeSearch ? "SÍ" : "NO"}
+- Estilo: ${stylePreset}
 
-Genera el código web completo, con diseño pulido nivel desarrollador senior de Claude, interacción responsive completa y código HTML standalone limpio en 'previewHtml' listo para renderizar en un iframe sandbox.`;
+Devuelve el objeto JSON estricto con los campos: title, tagline, category, hasRealtimeSearch, stepLog (array de 6 pasos), designSystem, searchConfig y array 'files' con exactamente index.html, styles.css y app.js.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
-      contents: userPrompt,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        temperature: 0.2,
+    const result = await generateValidatedJson(
+      ai,
+      {
+        model: "gemini-3.6-flash",
+        contents: userPrompt,
+        config: {
+          systemInstruction,
+          temperature: 0.2,
+        },
       },
+      WebsiteStructureSchema,
+      "/api/generate-website"
+    );
+
+    const generatedData = result.data;
+    const webId = "web_" + Date.now();
+    const previewHtml = assemblePreviewHtml(generatedData.files, generatedData.title);
+
+    const fullWebsiteRecord: StoredWebsite = {
+      id: webId,
+      title: generatedData.title,
+      tagline: generatedData.tagline,
+      category: generatedData.category,
+      hasRealtimeSearch: generatedData.hasRealtimeSearch,
+      stepLog: generatedData.stepLog,
+      designSystem: generatedData.designSystem,
+      searchConfig: generatedData.searchConfig,
+      files: generatedData.files,
+      createdAt: new Date().toISOString(),
+      promptUsed: prompt,
+    };
+
+    // Store in server memory for incremental patch refinements
+    websiteStore.set(webId, fullWebsiteRecord);
+
+    logStructured({
+      endpoint: "/api/generate-website",
+      durationMs: Date.now() - startTime,
+      status: "success",
+      tokensUsed: {
+        promptTokens: result.usageMetadata?.promptTokenCount,
+        responseTokens: result.usageMetadata?.candidatesTokenCount,
+        totalTokens: result.usageMetadata?.totalTokenCount,
+      },
+      ip: req.ip,
+      details: { webId, filesCount: generatedData.files.length },
     });
 
-    const jsonText = response.text || "{}";
-    let parsedData;
-    try {
-      parsedData = JSON.parse(jsonText);
-    } catch (parseError) {
-      console.error("Error al parsear JSON devuelto por Gemini:", parseError);
-      return res.status(500).json({ error: "No se pudo formatear la respuesta del modelo en JSON válido." });
-    }
-
-    // Attach metadata
-    parsedData.id = "web_" + Date.now();
-    parsedData.createdAt = new Date().toISOString();
-    parsedData.promptUsed = prompt;
-
-    res.json(parsedData);
+    res.json({
+      ...fullWebsiteRecord,
+      previewHtml,
+    });
   } catch (err: any) {
-    console.error("Error en /api/generate-website:", err);
+    logStructured({
+      endpoint: "/api/generate-website",
+      durationMs: Date.now() - startTime,
+      status: "error",
+      error: err.message || String(err),
+      ip: req.ip,
+    });
     res.status(500).json({
-      error: "Error generando la página web con ClaudeCraft Engine.",
+      error: "Error generando la página web.",
       details: err.message || String(err),
     });
   }
 });
 
-// Refine Website Endpoint
-app.post("/api/refine-website", async (req, res) => {
+// 4. Targeted Incremental Refinement Endpoint
+app.post("/api/refine-website", apiLimiter, authMiddleware, async (req: Request, res: Response) => {
+  const startTime = Date.now();
   try {
     const { website, instruction } = req.body;
 
-    if (!website || !instruction) {
-      return res.status(400).json({ error: "Se requiere 'website' e 'instruction'." });
+    if (!instruction || typeof instruction !== "string") {
+      logStructured({
+        endpoint: "/api/refine-website",
+        durationMs: Date.now() - startTime,
+        status: "error",
+        error: "Instrucción de refinamiento ausente",
+        ip: req.ip,
+      });
+      return res.status(400).json({ error: "Se requiere 'instruction' válida." });
+    }
+
+    const webId = website?.id;
+    let storedRecord = webId ? websiteStore.get(webId) : null;
+
+    // Fallback if website was not found in server map
+    if (!storedRecord && website?.files) {
+      storedRecord = {
+        id: webId || "web_" + Date.now(),
+        title: website.title || "Página Web",
+        tagline: website.tagline || "",
+        category: website.category || "custom",
+        hasRealtimeSearch: Boolean(website.hasRealtimeSearch),
+        stepLog: website.stepLog || [],
+        designSystem: website.designSystem || {},
+        searchConfig: website.searchConfig,
+        files: website.files,
+        createdAt: new Date().toISOString(),
+        promptUsed: website.promptUsed || "",
+      };
+    }
+
+    if (!storedRecord) {
+      return res.status(404).json({ error: "No se encontraron los archivos originales de la web para refinar." });
     }
 
     const ai = getGeminiClient();
 
-    const systemInstruction = `Eres "ClaudeCraft Refinement Engine". Recibirás una aplicación/página web existente en formato JSON y una instrucción de modificación quirúrgica del usuario.
-Modifica el código HTML/CSS/JS y la vista previa en 'previewHtml' para aplicar la mejora sin romper la estructura existente ni agregar clichés de IA.
-Mantiene la misma estructura JSON que recibiste.`;
+    const existingFilesSummary = storedRecord.files
+      .map((f) => `--- ARCHIVO: ${f.path} (${f.language}) ---\n${f.content}\n`)
+      .join("\n");
 
-    const userPrompt = `Página web existente:
-Título: ${website.title}
-Vista HTML previa actual:
-\`\`\`html
-${website.previewHtml}
-\`\`\`
+    const systemInstruction = `Eres "ClaudeCraft Targeted Refinement Engine".
+Tu trabajo es aplicar un parche o modificación dirigida (patch) sobre los archivos existentes de la web.
+NO regeneres la aplicación entera sin necesidad. Revisa los archivos actuales y devuelve únicamente una explicación y la lista 'updatedFiles' con los archivos que sufrieron cambios o fueron creados/modificados.`;
 
-Instrucción de refinamiento del usuario:
+    const userPrompt = `Archivos actuales del proyecto "${storedRecord.title}":
+${existingFilesSummary}
+
+Instrucción de modificación del usuario:
 "${instruction}"
 
-Aplica las correcciones manteniendo la máxima atención al detalle, estilo limpio y funcionalidad. Retorna el JSON completo actualizado.`;
+Devuelve un JSON estricto con:
+- "explanation": Breve resumen del cambio aplicado.
+- "updatedFiles": Array de objetos { "path": string, "language": string, "content": string } que contienen el código completo actualizado de CADA archivo modificado.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
-      contents: userPrompt,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        temperature: 0.2,
+    const result = await generateValidatedJson(
+      ai,
+      {
+        model: "gemini-3.6-flash",
+        contents: userPrompt,
+        config: {
+          systemInstruction,
+          temperature: 0.2,
+        },
+      },
+      RefinePatchSchema,
+      "/api/refine-website"
+    );
+
+    const patchData = result.data;
+
+    // Apply incremental patch to stored files
+    const updatedFilesMap = new Map<string, StoredWebFile>();
+    storedRecord.files.forEach((f) => updatedFilesMap.set(f.path, f));
+
+    patchData.updatedFiles.forEach((uf) => {
+      updatedFilesMap.set(uf.path, uf);
+    });
+
+    const finalFiles = Array.from(updatedFilesMap.values());
+    storedRecord.files = finalFiles;
+    storedRecord.promptUsed = `${storedRecord.promptUsed} -> [Refinado: ${instruction}]`;
+
+    // Re-save updated record
+    websiteStore.set(storedRecord.id, storedRecord);
+
+    const updatedPreviewHtml = assemblePreviewHtml(finalFiles, storedRecord.title);
+
+    logStructured({
+      endpoint: "/api/refine-website",
+      durationMs: Date.now() - startTime,
+      status: "success",
+      tokensUsed: {
+        promptTokens: result.usageMetadata?.promptTokenCount,
+        responseTokens: result.usageMetadata?.candidatesTokenCount,
+        totalTokens: result.usageMetadata?.totalTokenCount,
+      },
+      ip: req.ip,
+      details: {
+        webId: storedRecord.id,
+        patchedFilesCount: patchData.updatedFiles.length,
+        explanation: patchData.explanation,
       },
     });
 
-    const jsonText = response.text || "{}";
-    const parsedData = JSON.parse(jsonText);
-    parsedData.id = website.id || "web_" + Date.now();
-    parsedData.createdAt = new Date().toISOString();
-    parsedData.promptUsed = `${website.promptUsed} -> [Refinado: ${instruction}]`;
-
-    res.json(parsedData);
+    res.json({
+      ...storedRecord,
+      previewHtml: updatedPreviewHtml,
+    });
   } catch (err: any) {
-    console.error("Error en /api/refine-website:", err);
+    logStructured({
+      endpoint: "/api/refine-website",
+      durationMs: Date.now() - startTime,
+      status: "error",
+      error: err.message || String(err),
+      ip: req.ip,
+    });
     res.status(500).json({
       error: "Error al refinar la página web.",
       details: err.message || String(err),
@@ -302,6 +676,8 @@ Aplica las correcciones manteniendo la máxima atención al detalle, estilo limp
 // -------------------------------------------------------------
 
 async function startServer() {
+  validateEnv();
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -317,7 +693,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 ClaudeCraft Web Studio corriendo en puerto http://0.0.0.0:${PORT}`);
+    console.log(`🚀 ClaudeCraft Web Studio corriendo en http://0.0.0.0:${PORT}`);
   });
 }
 
