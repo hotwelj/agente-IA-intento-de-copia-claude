@@ -157,26 +157,35 @@ async function generateValidatedJson<T>(
   let currentPrompt = params.contents;
   let lastError = "";
 
+  const mergedConfig = {
+    thinkingConfig: { thinkingBudget: 0 },
+    ...(params.config || {}),
+    responseMimeType: "application/json",
+  };
+
   while (attempts <= maxRetries) {
     attempts++;
     try {
       const response = await ai.models.generateContent({
         model: params.model,
         contents: currentPrompt,
-        config: {
-          ...(params.config || {}),
-          responseMimeType: "application/json",
-        },
+        config: mergedConfig,
       });
 
       checkFinishReason(response);
 
-      const rawText = response.text || "";
+      let rawText = (response.text || "").trim();
+
+      // Clean markdown code blocks if the model wrapped the JSON
+      if (rawText.startsWith("```")) {
+        rawText = rawText.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?\s*```$/i, "").trim();
+      }
+
       let parsedObj: any;
       try {
         parsedObj = JSON.parse(rawText);
       } catch (jsonErr: any) {
-        throw new Error(`JSON SyntaxError: ${jsonErr.message}`);
+        throw new Error(`JSON SyntaxError: ${jsonErr.message}. Texto recibido: ${rawText.slice(0, 100)}...`);
       }
 
       const validationResult = schema.safeParse(parsedObj);
@@ -208,7 +217,7 @@ async function generateValidatedJson<T>(
     }
   }
 
-  throw new Error("Excedido número máximo de reintentos.");
+  throw new Error(`Error en validación JSON para ${endpointName}`);
 }
 
 // 4. Server-Side In-Memory File Store for Incremental Refinements
@@ -369,13 +378,15 @@ app.post("/api/gemini/search", apiLimiter, authMiddleware, async (req: Request, 
 
     const ai = getGeminiClient();
 
-    const searchPrompt = `Estás actuando como un motor de búsqueda e investigación en tiempo real con Inteligencia Artificial nivel Claude.
-Búsqueda del usuario: "${query}"
-Categoría: ${category}
-Contexto o instrucción adicional: ${context}
+    const searchPrompt = `Responde a la siguiente consulta con información actualizada y precisa de internet:
+Consulta: "${query}"
+${context ? `Contexto adicional: "${context}"` : ""}
 
-Proporciona una respuesta extremadamente precisa, estructurada, actualizada y libre de rodeos ni frases genéricas de IA.
-Resume los hechos clave, datos cuantitativos más recientes y hallazgos principales en tiempo real.`;
+DIRECTRICES DE REDACCIÓN (HUMANA, CLARA Y CONCISA):
+1. Escribe con un tono natural, conversacional y directo, como si fueras un periodista o experto humano explicando el tema en un lenguaje sencillo.
+2. CERO MULETILLAS NI CLICHÉS DE IA: Prohibido iniciar con "¡Claro!", "Por supuesto", "Como IA", "A continuación te muestro", "En resumen", o "Es importante destacar". Ve directamente a la información principal.
+3. ESTILO FLUIDO: Escribe en 1 o 2 párrafos cortos y ordenados. EVITA listas con viñetas interminables o excesos de negritas en cada palabra salvo que el usuario pida explícitamente una lista de datos.
+4. Tono fresco, conciso y fácil de leer.`;
 
     let response;
     try {
@@ -385,6 +396,7 @@ Resume los hechos clave, datos cuantitativos más recientes y hallazgos principa
         config: {
           tools: [{ googleSearch: {} }],
           temperature: 0.3,
+          thinkingConfig: { thinkingBudget: 0 },
         },
       });
     } catch (searchToolErr: any) {
@@ -394,6 +406,7 @@ Resume los hechos clave, datos cuantitativos más recientes y hallazgos principa
         contents: searchPrompt,
         config: {
           temperature: 0.3,
+          thinkingConfig: { thinkingBudget: 0 },
         },
       });
     }
@@ -489,7 +502,10 @@ app.post("/api/generate-website", apiLimiter, authMiddleware, async (req: Reques
 Tu misión es generar la estructura de archivos modular para un sitio o aplicación web.
 
 REGLAS STRICTAS DE CALIDAD Y "ANTI-SLOP DE IA":
-1. NUNCA uses frases clichés de marketing de IA (ej: "Supercharge your workflow", "Empower your business").
+1. REDACCIÓN Y COPYWRITING 100% HUMANO:
+   - Todo el contenido textual (títulos, subtítulos, descripciones, párrafos, tarjetas, botones) DEBE sonar escrito por un profesional o copywriter humano.
+   - NUNCA uses frases clichés ni jerga de IA ("Supercharge your workflow", "Empower your business", "En el dinámico mundo actual", "Solución integral de vanguardia").
+   - Escribe textos auténticos, sencillos, cálidos, directos y con personalidad.
 2. NUNCA crees páginas oscuras genéricas con gradientes neón azul/púrpura ni efectos fosforescentes deslumbrantes.
 3. ESTILOS VISUALES IMPECABLES:
    - Aplica el tema visual: ${themeDetails}
@@ -523,6 +539,7 @@ Devuelve el objeto JSON estricto con los campos: title, tagline, category, hasRe
         config: {
           systemInstruction,
           temperature: 0.2,
+          thinkingConfig: { thinkingBudget: 0 },
         },
       },
       WebsiteStructureSchema,
@@ -653,6 +670,7 @@ Devuelve un JSON estricto con:
         config: {
           systemInstruction,
           temperature: 0.2,
+          thinkingConfig: { thinkingBudget: 0 },
         },
       },
       RefinePatchSchema,
