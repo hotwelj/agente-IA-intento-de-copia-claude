@@ -28,7 +28,10 @@ export const WebsitePreview: React.FC<WebsitePreviewProps> = ({ website, onRefin
     try {
       const response = await fetch('/api/gemini/search', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': import.meta.env.VITE_APP_API_KEY,
+        },
         body: JSON.stringify({ query: testQuery }),
       });
       const data = await response.json();

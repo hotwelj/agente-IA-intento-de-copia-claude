@@ -55,7 +55,10 @@ export default function App() {
     try {
       const response = await fetch('/api/generate-website', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': import.meta.env.VITE_APP_API_KEY,
+        },
         body: JSON.stringify({ prompt, options }),
       });
 
@@ -83,7 +86,10 @@ export default function App() {
     try {
       const response = await fetch('/api/refine-website', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': import.meta.env.VITE_APP_API_KEY,
+        },
         body: JSON.stringify({ website: activeWebsite, instruction }),
       });
 
