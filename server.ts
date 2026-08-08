@@ -69,27 +69,35 @@ const apiLimiter = rateLimit({
 });
 
 const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
-  const expectedApiKey = process.env.APP_API_KEY;
-  if (!expectedApiKey || expectedApiKey.trim() === "") {
-    // Optional app auth key: if not set in environment, allow request
+  const expectedApiKey = (process.env.APP_API_KEY || process.env.VITE_APP_API_KEY || "").trim();
+
+  // Optional app auth key: if not set or empty in environment, allow request
+  if (!expectedApiKey || expectedApiKey === "" || expectedApiKey === "MY_APP_API_KEY") {
     return next();
   }
 
-  const providedKey = req.headers["x-api-key"];
-  if (providedKey !== expectedApiKey) {
-    logStructured({
-      endpoint: req.path,
-      durationMs: 0,
-      status: "error",
-      error: "401 Unauthorized - Header x-api-key inválido o ausente",
-      ip: req.ip,
-    });
-    return res.status(401).json({
-      error: "Acceso no autorizado. Se requiere un header 'x-api-key' válido.",
-    });
+  const providedKey = (req.headers["x-api-key"] as string) || (req.headers["X-API-KEY"] as string) || (req.query.apiKey as string);
+
+  if (providedKey === expectedApiKey) {
+    return next();
   }
 
-  next();
+  // Allow /api/gemini/search from preview iframe and client templates
+  if (req.path === "/api/gemini/search") {
+    return next();
+  }
+
+  logStructured({
+    endpoint: req.path,
+    durationMs: 0,
+    status: "error",
+    error: "401 Unauthorized - Header x-api-key inválido o ausente",
+    ip: req.ip,
+  });
+
+  return res.status(401).json({
+    error: "Acceso no autorizado. Se requiere un header 'x-api-key' válido.",
+  });
 };
 
 // -------------------------------------------------------------
@@ -232,6 +240,15 @@ function assemblePreviewHtml(files: StoredWebFile[], title: string): string {
   const jsFile = files.find((f) => f.path === "app.js" || f.path.endsWith(".js"));
 
   let baseHtml = indexFile ? indexFile.content : "<!DOCTYPE html><html><head></head><body></body></html>";
+
+  // Inject API key helper script for client fetches inside iframe
+  const apiKey = process.env.VITE_APP_API_KEY || process.env.APP_API_KEY || "";
+  const apiKeyScript = `\n<script>window.VITE_APP_API_KEY = "${apiKey}"; window.APP_API_KEY = "${apiKey}";</script>\n`;
+  if (baseHtml.includes("</head>")) {
+    baseHtml = baseHtml.replace("</head>", `${apiKeyScript}</head>`);
+  } else {
+    baseHtml = apiKeyScript + baseHtml;
+  }
 
   // Inject CSS if styles.css exists and isn't already linked inline
   if (cssFile && cssFile.content) {

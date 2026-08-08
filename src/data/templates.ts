@@ -622,9 +622,13 @@ export const PRESET_TEMPLATES: GeneratedWebsite[] = [
       resDiv.innerHTML = '<p class="text-stone-500 text-sm animate-pulse">Buscando fuentes oficiales en Google...</p>';
 
       try {
+        const apiKey = (window.VITE_APP_API_KEY || window.APP_API_KEY || '');
         const res = await fetch('/api/gemini/search', {
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey
+          },
           body: JSON.stringify({ query: q, context: 'Verificación de hechos periodísticos' })
         });
         const data = await res.json();

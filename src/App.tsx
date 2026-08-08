@@ -32,6 +32,7 @@ export default function App() {
   const handleGenerate = async (prompt: string, options: GenerationOptions) => {
     setIsGenerating(true);
     setError(null);
+    const previousWebsite = activeWebsite;
 
     // Initial placeholder step log for feedback
     const pendingSteps: GeneratedWebsite = {
@@ -57,7 +58,7 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': import.meta.env.VITE_APP_API_KEY,
+          'x-api-key': import.meta.env.VITE_APP_API_KEY || '',
         },
         body: JSON.stringify({ prompt, options }),
       });
@@ -71,6 +72,7 @@ export default function App() {
       setActiveWebsite(data);
     } catch (err: any) {
       console.error('Error generando web:', err);
+      setActiveWebsite(previousWebsite);
       setError(err.message || 'No se pudo generar la web. Por favor intenta nuevamente.');
     } finally {
       setIsGenerating(false);
