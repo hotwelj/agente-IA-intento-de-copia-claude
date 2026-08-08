@@ -35,7 +35,11 @@ export const WebsitePreview: React.FC<WebsitePreviewProps> = ({ website, onRefin
         body: JSON.stringify({ query: testQuery }),
       });
       const data = await response.json();
-      setTestResult(data);
+      if (!response.ok) {
+        setTestResult({ error: data.error || data.details || 'Error realizando la búsqueda.' });
+      } else {
+        setTestResult(data);
+      }
     } catch (err: any) {
       setTestResult({ error: err.message || 'Error realizando la búsqueda.' });
     } finally {

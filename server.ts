@@ -285,48 +285,56 @@ const SearchResponseSchema = z.object({
 });
 
 const DevStepSchema = z.object({
-  step: z.number(),
-  title: z.string(),
-  detail: z.string(),
-  status: z.enum(["pending", "active", "done"]),
+  step: z.number().optional().default(1),
+  title: z.string().optional().default("Paso de desarrollo"),
+  detail: z.string().optional().default("Detalle del proceso"),
+  status: z.string().optional().default("done"),
 });
 
 const DesignSystemSchema = z.object({
-  primaryColor: z.string(),
-  backgroundColor: z.string(),
-  fontHeader: z.string(),
-  fontBody: z.string(),
-  spacingRatio: z.string(),
-  antiSlopRulesApplied: z.array(z.string()),
+  primaryColor: z.string().optional().default("#0284c7"),
+  backgroundColor: z.string().optional().default("#0f172a"),
+  fontHeader: z.string().optional().default("sans-serif"),
+  fontBody: z.string().optional().default("sans-serif"),
+  spacingRatio: z.string().optional().default("1.25"),
+  antiSlopRulesApplied: z.array(z.string()).optional().default([]),
 });
 
 const SearchConfigSchema = z
   .object({
-    defaultQuery: z.string(),
-    placeholder: z.string(),
-    searchType: z.enum(["news", "market", "general", "facts", "places"]),
+    defaultQuery: z.string().optional().default("Noticias"),
+    placeholder: z.string().optional().default("Buscar..."),
+    searchType: z.string().optional().default("general"),
   })
-  .optional();
+  .optional()
+  .nullable();
 
 const WebFileSchema = z.object({
   path: z.string(),
-  language: z.string(),
+  language: z.string().optional().default("javascript"),
   content: z.string(),
 });
 
 const WebsiteStructureSchema = z.object({
-  title: z.string(),
-  tagline: z.string(),
-  category: z.enum(["landing", "portfolio", "saas", "search-app", "dashboard", "editorial", "custom"]),
-  hasRealtimeSearch: z.boolean(),
-  stepLog: z.array(DevStepSchema),
-  designSystem: DesignSystemSchema,
+  title: z.string().optional().default("Sitio Web Generado"),
+  tagline: z.string().optional().default("Generado con Inteligencia Artificial"),
+  category: z.string().optional().default("landing"),
+  hasRealtimeSearch: z.boolean().optional().default(false),
+  stepLog: z.array(DevStepSchema).optional().default([]),
+  designSystem: DesignSystemSchema.optional().default({
+    primaryColor: "#0284c7",
+    backgroundColor: "#0f172a",
+    fontHeader: "sans-serif",
+    fontBody: "sans-serif",
+    spacingRatio: "1.25",
+    antiSlopRulesApplied: [],
+  }),
   searchConfig: SearchConfigSchema,
   files: z.array(WebFileSchema),
 });
 
 const RefinePatchSchema = z.object({
-  explanation: z.string(),
+  explanation: z.string().optional().default("Cambios aplicados correctamente."),
   updatedFiles: z.array(WebFileSchema),
 });
 
@@ -369,14 +377,26 @@ Contexto o instrucción adicional: ${context}
 Proporciona una respuesta extremadamente precisa, estructurada, actualizada y libre de rodeos ni frases genéricas de IA.
 Resume los hechos clave, datos cuantitativos más recientes y hallazgos principales en tiempo real.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: searchPrompt,
-      config: {
-        tools: [{ googleSearch: {} }],
-        temperature: 0.3,
-      },
-    });
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: "gemini-3.6-flash",
+        contents: searchPrompt,
+        config: {
+          tools: [{ googleSearch: {} }],
+          temperature: 0.3,
+        },
+      });
+    } catch (searchToolErr: any) {
+      console.warn("⚠️ Google Search tool error, falling back to gemini-3.6-flash standard synthesis:", searchToolErr?.message);
+      response = await ai.models.generateContent({
+        model: "gemini-3.6-flash",
+        contents: searchPrompt,
+        config: {
+          temperature: 0.3,
+        },
+      });
+    }
 
     checkFinishReason(response);
 
@@ -498,7 +518,7 @@ Devuelve el objeto JSON estricto con los campos: title, tagline, category, hasRe
     const result = await generateValidatedJson(
       ai,
       {
-        model: "gemini-2.5-flash",
+        model: "gemini-3.6-flash",
         contents: userPrompt,
         config: {
           systemInstruction,
@@ -628,7 +648,7 @@ Devuelve un JSON estricto con:
     const result = await generateValidatedJson(
       ai,
       {
-        model: "gemini-2.5-flash",
+        model: "gemini-3.6-flash",
         contents: userPrompt,
         config: {
           systemInstruction,
