@@ -141,7 +141,7 @@ function checkFinishReason(response: any) {
   return candidate;
 }
 
-// 2. JSON Validation & Automatic Retry Engine (up to 2 retries)
+// 2. JSON Validation & Automatic Retry Engine with Multi-Model Fallback
 async function generateValidatedJson<T>(
   ai: GoogleGenAI,
   params: {
@@ -152,72 +152,84 @@ async function generateValidatedJson<T>(
   schema: z.ZodSchema<T>,
   endpointName: string
 ): Promise<{ data: T; usageMetadata?: any }> {
-  let attempts = 0;
-  const maxRetries = 2;
-  let currentPrompt = params.contents;
+  const candidateModels = [params.model, "gemini-3.5-flash", "gemini-3.1-flash-lite"].filter(
+    (v, i, a) => a.indexOf(v) === i
+  );
+
   let lastError = "";
 
   const mergedConfig = {
-    thinkingConfig: { thinkingBudget: 0 },
     ...(params.config || {}),
     responseMimeType: "application/json",
   };
 
-  while (attempts <= maxRetries) {
-    attempts++;
-    try {
-      const response = await ai.models.generateContent({
-        model: params.model,
-        contents: currentPrompt,
-        config: mergedConfig,
-      });
+  for (const currentModel of candidateModels) {
+    let attempts = 0;
+    const maxRetries = 1;
+    let currentPrompt = params.contents;
 
-      checkFinishReason(response);
-
-      let rawText = (response.text || "").trim();
-
-      // Clean markdown code blocks if the model wrapped the JSON
-      if (rawText.startsWith("```")) {
-        rawText = rawText.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?\s*```$/i, "").trim();
-      }
-
-      let parsedObj: any;
+    while (attempts <= maxRetries) {
+      attempts++;
       try {
-        parsedObj = JSON.parse(rawText);
-      } catch (jsonErr: any) {
-        throw new Error(`JSON SyntaxError: ${jsonErr.message}. Texto recibido: ${rawText.slice(0, 100)}...`);
-      }
+        const response = await ai.models.generateContent({
+          model: currentModel,
+          contents: currentPrompt,
+          config: mergedConfig,
+        });
 
-      const validationResult = schema.safeParse(parsedObj);
-      if (!validationResult.success) {
-        const issues = validationResult.error.issues
-          .map((e) => `${e.path.join(".")}: ${e.message}`)
-          .join("; ");
-        throw new Error(`Zod ValidationError: ${issues}`);
-      }
+        checkFinishReason(response);
 
-      return {
-        data: validationResult.data,
-        usageMetadata: response.usageMetadata,
-      };
-    } catch (err: any) {
-      lastError = err.message || String(err);
-      console.warn(
-        `[${endpointName}] Intento ${attempts}/${maxRetries + 1} falló en validación JSON/FinishReason: ${lastError}`
-      );
+        let rawText = (response.text || "").trim();
 
-      if (attempts > maxRetries) {
-        throw new Error(
-          `Error persistente en formateo JSON tras ${maxRetries + 1} intentos: ${lastError}`
+        // Clean markdown code blocks if the model wrapped the JSON
+        if (rawText.startsWith("```")) {
+          rawText = rawText.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?\s*```$/i, "").trim();
+        }
+
+        let parsedObj: any;
+        try {
+          parsedObj = JSON.parse(rawText);
+        } catch (jsonErr: any) {
+          throw new Error(`JSON SyntaxError: ${jsonErr.message}. Texto: ${rawText.slice(0, 100)}`);
+        }
+
+        const validationResult = schema.safeParse(parsedObj);
+        if (!validationResult.success) {
+          const issues = validationResult.error.issues
+            .map((e) => `${e.path.join(".")}: ${e.message}`)
+            .join("; ");
+          throw new Error(`Zod ValidationError: ${issues}`);
+        }
+
+        return {
+          data: validationResult.data,
+          usageMetadata: response.usageMetadata,
+        };
+      } catch (err: any) {
+        lastError = err.message || String(err);
+        console.warn(
+          `[${endpointName}] Modelo ${currentModel} intento ${attempts} falló: ${lastError}`
         );
-      }
 
-      // Retry prompt feeding back the specific error
-      currentPrompt = `${params.contents}\n\n[ATENCIÓN: Tu intento anterior falló con el siguiente error de validación JSON: "${lastError}". Por favor re-genera la respuesta corrigiendo este error exacto y asegúrate de cumplir la estructura JSON válida esperada.]`;
+        // Immediate failover to next model on quota limit (429) or missing model (404)
+        if (
+          lastError.includes("429") ||
+          lastError.includes("RESOURCE_EXHAUSTED") ||
+          lastError.includes("404") ||
+          lastError.includes("NOT_FOUND")
+        ) {
+          console.warn(`[${endpointName}] Fallo de cuota/acceso en ${currentModel}. Probando siguiente modelo...`);
+          break;
+        }
+
+        if (attempts <= maxRetries) {
+          currentPrompt = `${params.contents}\n\n[ATENCIÓN: Tu intento anterior falló con error: "${lastError}". Re-genera en JSON estricto cumpliendo el esquema.]`;
+        }
+      }
     }
   }
 
-  throw new Error(`Error en validación JSON para ${endpointName}`);
+  throw new Error(`Error en generación de datos. Último error: ${lastError}`);
 }
 
 // 4. Server-Side In-Memory File Store for Incremental Refinements
@@ -378,37 +390,51 @@ app.post("/api/gemini/search", apiLimiter, authMiddleware, async (req: Request, 
 
     const ai = getGeminiClient();
 
-    const searchPrompt = `Responde a la siguiente consulta con información actualizada y precisa de internet:
+    const searchPrompt = `Responde a la siguiente consulta con información actualizada y precisa:
 Consulta: "${query}"
 ${context ? `Contexto adicional: "${context}"` : ""}
 
-DIRECTRICES DE REDACCIÓN (HUMANA, CLARA Y CONCISA):
-1. Escribe con un tono natural, conversacional y directo, como si fueras un periodista o experto humano explicando el tema en un lenguaje sencillo.
-2. CERO MULETILLAS NI CLICHÉS DE IA: Prohibido iniciar con "¡Claro!", "Por supuesto", "Como IA", "A continuación te muestro", "En resumen", o "Es importante destacar". Ve directamente a la información principal.
-3. ESTILO FLUIDO: Escribe en 1 o 2 párrafos cortos y ordenados. EVITA listas con viñetas interminables o excesos de negritas en cada palabra salvo que el usuario pida explícitamente una lista de datos.
-4. Tono fresco, conciso y fácil de leer.`;
+DIRECTRICES DE REDACCIÓN (HUMANA, DIRECTA Y NATURAL):
+1. Escribe con un lenguaje 100% humano, directo y conversacional, como si fueras un especialista o periodista explicando el tema a un colega.
+2. ABSOLUTAMENTE NINGUNA MULETILLA DE IA: Prohibido usar "¡Claro!", "Por supuesto", "Como modelo de IA", "En el mundo dinámico de hoy", "En resumen", o "A continuación se detalla".
+3. FORMATO LIMPIO Y LIGERO: Escribe en 1 o 2 párrafos cortos y bien estructurados. No abuses de negritas ni uses listas largas salvo que el usuario pida datos tabulares o una lista específica.
+4. Tono ágil, claro y al grano.`;
 
-    let response;
-    try {
-      response = await ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: searchPrompt,
-        config: {
-          tools: [{ googleSearch: {} }],
-          temperature: 0.3,
-          thinkingConfig: { thinkingBudget: 0 },
-        },
-      });
-    } catch (searchToolErr: any) {
-      console.warn("⚠️ Google Search tool error, falling back to gemini-3.6-flash standard synthesis:", searchToolErr?.message);
-      response = await ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: searchPrompt,
-        config: {
-          temperature: 0.3,
-          thinkingConfig: { thinkingBudget: 0 },
-        },
-      });
+    const candidateModels = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
+    let response: any = null;
+    let lastError: any = null;
+
+    for (const modelName of candidateModels) {
+      try {
+        response = await ai.models.generateContent({
+          model: modelName,
+          contents: searchPrompt,
+          config: {
+            tools: [{ googleSearch: {} }],
+            temperature: 0.3,
+          },
+        });
+        if (response) break;
+      } catch (err1: any) {
+        console.warn(`[search] Fallo con herramientas en ${modelName} (${err1?.message}). Probando sin herramientas...`);
+        try {
+          response = await ai.models.generateContent({
+            model: modelName,
+            contents: searchPrompt,
+            config: {
+              temperature: 0.3,
+            },
+          });
+          if (response) break;
+        } catch (err2: any) {
+          lastError = err2;
+          console.warn(`[search] Modelo ${modelName} no disponible (${err2?.message}). Probando siguiente modelo...`);
+        }
+      }
+    }
+
+    if (!response) {
+      throw lastError || new Error("No se pudo obtener respuesta de la IA.");
     }
 
     checkFinishReason(response);

@@ -34,24 +34,42 @@ export default function App() {
     setError(null);
     const previousWebsite = activeWebsite;
 
-    // Initial placeholder step log for feedback
-    const pendingSteps: GeneratedWebsite = {
+    const initialSteps = [
+      { step: 1, title: 'Análisis de Requerimientos & UX', detail: 'Analizando intención del usuario y definiendo arquitectura de información...', status: 'active' as const },
+      { step: 2, title: 'Sistema de Diseño Anti-Slop', detail: 'Configurando escala matemática de espaciado y tipografía sin clichés...', status: 'pending' as const },
+      { step: 3, title: 'Arquitectura de Estado & Lógica', detail: 'Definiendo componentes interactivos e interacciones del usuario...', status: 'pending' as const },
+      { step: 4, title: 'Integración Búsqueda Google IA', detail: options.enableRealtimeSearch ? 'Configurando endpoint /api/gemini/search y cliente JS...' : 'Búsqueda no requerida para esta página.', status: 'pending' as const },
+      { step: 5, title: 'Generación de Código HTML/CSS/JS', detail: 'Escribiendo código limpio y optimizado con Gemini AI...', status: 'pending' as const },
+      { step: 6, title: 'Auditoría Final de Detalle', detail: 'Verificando contraste WCAG y micro-interacciones...', status: 'pending' as const }
+    ];
+
+    let currentActiveStep = 1;
+
+    const pendingWebsite: GeneratedWebsite = {
       ...activeWebsite,
       id: 'gen_' + Date.now(),
       title: 'Generando aplicación web...',
       tagline: 'Ejecutando metodología de desarrollo paso a paso sin omitir detalles...',
       promptUsed: prompt,
-      stepLog: [
-        { step: 1, title: 'Análisis de Requerimientos & UX', detail: 'Analizando intención del usuario y definiendo arquitectura de información...', status: 'active' },
-        { step: 2, title: 'Sistema de Diseño Anti-Slop', detail: 'Configurando escala matemática de espaciado y tipografía sin clichés...', status: 'pending' },
-        { step: 3, title: 'Arquitectura de Estado & Lógica', detail: 'Definiendo componentes interactivos e interacciones del usuario...', status: 'pending' },
-        { step: 4, title: 'Integración Búsqueda Google IA', detail: options.enableRealtimeSearch ? 'Configurando endpoint /api/gemini/search y cliente JS...' : 'Búsqueda no requerida para esta página.', status: 'pending' },
-        { step: 5, title: 'Generación de Código HTML/CSS/JS', detail: 'Escribiendo código limpio y optimizado...', status: 'pending' },
-        { step: 6, title: 'Auditoría Final de Detalle', detail: 'Verificando contraste WCAG y micro-interacciones...', status: 'pending' }
-      ]
+      stepLog: initialSteps
     };
 
-    setActiveWebsite(pendingSteps);
+    setActiveWebsite(pendingWebsite);
+
+    // Animate progress step by step
+    const progressInterval = setInterval(() => {
+      if (currentActiveStep < 6) {
+        currentActiveStep++;
+        setActiveWebsite((prev) => ({
+          ...prev,
+          stepLog: prev.stepLog.map((s) => {
+            if (s.step < currentActiveStep) return { ...s, status: 'done' };
+            if (s.step === currentActiveStep) return { ...s, status: 'active' };
+            return { ...s, status: 'pending' };
+          })
+        }));
+      }
+    }, 2500);
 
     try {
       const response = await fetch('/api/generate-website', {
@@ -69,12 +87,19 @@ export default function App() {
         throw new Error(data.error || 'Error al generar la página web.');
       }
 
-      setActiveWebsite(data);
+      // Mark all steps done on success
+      const completedData = {
+        ...data,
+        stepLog: (data.stepLog || initialSteps).map((s: any) => ({ ...s, status: 'done' }))
+      };
+
+      setActiveWebsite(completedData);
     } catch (err: any) {
       console.error('Error generando web:', err);
       setActiveWebsite(previousWebsite);
       setError(err.message || 'No se pudo generar la web. Por favor intenta nuevamente.');
     } finally {
+      clearInterval(progressInterval);
       setIsGenerating(false);
     }
   };
